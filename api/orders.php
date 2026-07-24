@@ -72,18 +72,34 @@ if ($method === 'POST' && ($action === 'create' || empty($action))) {
         $amount = floatval($prod['price']);
     }
 
-    // Handle File Upload
+    // Handle File Upload (Supports All Images & PDFs)
     $paymentProofPath = 'uploads/proof_default.png';
     if (isset($_FILES['payment_proof']) && $_FILES['payment_proof']['error'] === UPLOAD_ERR_OK) {
         $uploadDir = __DIR__ . '/../uploads/';
         if (!file_exists($uploadDir)) {
             mkdir($uploadDir, 0777, true);
         }
-        $ext = pathinfo($_FILES['payment_proof']['name'], PATHINFO_EXTENSION);
+        $ext = strtolower(pathinfo($_FILES['payment_proof']['name'], PATHINFO_EXTENSION));
+        $allowedExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'heic', 'tiff', 'pdf'];
+        if (!in_array($ext, $allowedExts)) {
+            sendJsonResponse(['success' => false, 'message' => 'Invalid file format. Allowed formats: JPG, PNG, WEBP, GIF, PDF.'], 400);
+        }
+
         $filename = 'proof_' . time() . '_' . rand(1000, 9999) . '.' . ($ext ?: 'jpg');
         $targetFile = $uploadDir . $filename;
         if (move_uploaded_file($_FILES['payment_proof']['tmp_name'], $targetFile)) {
             $paymentProofPath = 'uploads/' . $filename;
+        }
+    }
+
+
+    // Check user's referred_by_reseller_id if resellerId is not provided
+    if (!$resellerId) {
+        $uStmt = $pdo->prepare("SELECT referred_by_reseller_id FROM users WHERE id = ?");
+        $uStmt->execute([$userId]);
+        $uRow = $uStmt->fetch();
+        if ($uRow && !empty($uRow['referred_by_reseller_id'])) {
+            $resellerId = intval($uRow['referred_by_reseller_id']);
         }
     }
 
@@ -102,6 +118,12 @@ if ($method === 'POST' && ($action === 'create' || empty($action))) {
     ]);
 
     $orderId = $pdo->lastInsertId();
+
+    // Sync to payment_requests table
+    try {
+        $prStmt = $pdo->prepare("INSERT INTO payment_requests (order_id, user_id, product_id, amount, transaction_id, payment_proof, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
+        $prStmt->execute([$orderId, $userId, $productId, $amount, $transactionId, $paymentProofPath]);
+    } catch (Exception $e) {}
 
     // Log action
     $logStmt = $pdo->prepare("INSERT INTO activity_logs (user_id, action_type, description) VALUES (?, 'order_created', ?)");
@@ -164,6 +186,13 @@ if ($method === 'POST' && $action === 'approve') {
         $updateOrder = $pdo->prepare("UPDATE orders SET status = 'approved', start_date = ?, next_billing_date = ? WHERE id = ?");
         $updateOrder->execute([$startDate, $nextBillingDate, $orderId]);
 
+        // Sync payment_requests table
+        $pdo->prepare("UPDATE payment_requests SET status = 'approved' WHERE order_id = ?")->execute([$orderId]);
+
+        // Insert into purchases table
+        $purStmt = $pdo->prepare("INSERT INTO purchases (order_id, user_id, product_id, reseller_id, amount, status) VALUES (?, ?, ?, ?, ?, 'Approved')");
+        $purStmt->execute([$orderId, $order['user_id'], $order['product_id'], $order['reseller_id'], $order['amount']]);
+
         // 4. DEDUCT STOCK & UPDATE PRODUCT REVENUE/SUBSCRIBERS
         $newStock = $order['current_stock'] - $requestedQty;
         $newSubs = $order['subscribers_count'] + 1;
@@ -177,16 +206,15 @@ if ($method === 'POST' && $action === 'approve') {
         if (!empty($order['reseller_id'])) {
             $resellerId = intval($order['reseller_id']);
 
-            // Fetch reseller's current items sold
-            $rStmt = $pdo->prepare("SELECT total_items_sold FROM users WHERE id = ? FOR UPDATE");
+            // Fetch reseller's current items sold and commission_rate
+            $rStmt = $pdo->prepare("SELECT total_items_sold, COALESCE(commission_rate, 10.00) as commission_rate FROM users WHERE id = ? FOR UPDATE");
             $rStmt->execute([$resellerId]);
             $reseller = $rStmt->fetch();
 
             $currentSold = intval($reseller['total_items_sold'] ?? 0);
-            
-            // Commission rule: 10% base, 12% if total_items_sold >= 50
-            $commissionRate = ($currentSold >= 50) ? 12.00 : 10.00;
+            $commissionRate = floatval($reseller['commission_rate'] ?? 10.00);
             $commissionEarned = round(($order['amount'] * $commissionRate) / 100, 2);
+
 
             // Update order's commission_earned
             $pdo->prepare("UPDATE orders SET commission_earned = ? WHERE id = ?")
@@ -218,7 +246,7 @@ if ($method === 'POST' && $action === 'approve') {
 
         sendJsonResponse([
             'success' => true,
-            'message' => 'Payment approved successfully! Subscription activated.',
+            'message' => 'Payment approved successfully! Purchase activated.',
             'order_id' => $orderId,
             'remaining_stock' => $newStock,
             'commission_earned' => $commissionEarned
@@ -247,6 +275,11 @@ if ($method === 'POST' && $action === 'reject') {
     $stmt = $pdo->prepare("UPDATE orders SET status = 'rejected', rejection_reason = ? WHERE id = ?");
     $stmt->execute([$reason, $orderId]);
 
+    // Sync payment_requests table
+    try {
+        $pdo->prepare("UPDATE payment_requests SET status = 'rejected', rejection_reason = ? WHERE order_id = ?")->execute([$reason, $orderId]);
+    } catch (Exception $e) {}
+
     // Log Activity
     $logStmt = $pdo->prepare("INSERT INTO activity_logs (user_id, action_type, description) VALUES (?, 'order_rejected', ?)");
     $logStmt->execute([$adminId, "Rejected order #$orderId. Reason: $reason"]);
@@ -257,3 +290,4 @@ if ($method === 'POST' && $action === 'reject') {
         'order_id' => $orderId
     ]);
 }
+

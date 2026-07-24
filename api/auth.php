@@ -97,9 +97,14 @@ if ($method === 'POST' && $action === 'login') {
                     'id' => $user['id'],
                     'name' => $user['name'],
                     'email' => $user['email'],
-                    'role' => $user['role']
+                    'role' => $user['role'],
+                    'referral_code' => $user['referral_code'] ?? null,
+                    'commission_rate' => $user['commission_rate'] ?? 10.00,
+                    'upi_id' => $user['upi_id'] ?? null,
+                    'company_name' => $user['company_name'] ?? null
                 ]
             ]);
+
         } else {
             sendJsonResponse(['success' => false, 'message' => 'Invalid password.'], 401);
         }
@@ -127,10 +132,12 @@ if ($method === 'POST' && $action === 'register') {
     $name = trim($input['name'] ?? '');
     $email = strtolower(trim($input['email'] ?? ''));
     $password = trim($input['password'] ?? '');
-    $role = in_array($input['role'] ?? '', ['reseller', 'user']) ? $input['role'] : 'reseller';
+    $role = in_array($input['role'] ?? '', ['reseller', 'user']) ? $input['role'] : 'user';
     $phone = trim($input['phone'] ?? '');
+    $address = trim($input['address'] ?? '');
     $company_name = trim($input['company_name'] ?? '');
     $upi_id = trim($input['upi_id'] ?? '');
+    $referral_code_input = trim($input['referral_code'] ?? '');
 
     if (empty($name) || empty($email) || empty($password)) {
         sendJsonResponse(['success' => false, 'message' => 'Name, Email, and Password are required.'], 400);
@@ -148,9 +155,27 @@ if ($method === 'POST' && $action === 'register') {
 
     $hash = password_hash($password, PASSWORD_DEFAULT);
 
+    $referral_code = null;
+    $referred_by_reseller_id = null;
+
+    if ($role === 'reseller') {
+        // Generate unique referral code (e.g., REF004)
+        $refCountStmt = $pdo->query("SELECT COUNT(*) FROM users WHERE role = 'reseller'");
+        $count = $refCountStmt->fetchColumn() + 1;
+        $referral_code = 'REF' . str_pad($count, 3, '0', STR_PAD_LEFT);
+    } elseif (!empty($referral_code_input)) {
+        // Look up reseller by referral code
+        $refStmt = $pdo->prepare("SELECT id FROM users WHERE (referral_code = ? OR email = ?) AND role = 'reseller'");
+        $refStmt->execute([$referral_code_input, $referral_code_input]);
+        $resellerUser = $refStmt->fetch();
+        if ($resellerUser) {
+            $referred_by_reseller_id = $resellerUser['id'];
+        }
+    }
+
     try {
-        $stmt = $pdo->prepare("INSERT INTO users (name, email, password, role, phone, company_name, upi_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1)");
-        $stmt->execute([$name, $email, $hash, $role, $phone, $company_name, $upi_id]);
+        $stmt = $pdo->prepare("INSERT INTO users (name, email, password, role, phone, address, company_name, upi_id, referral_code, referred_by_reseller_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)");
+        $stmt->execute([$name, $email, $hash, $role, $phone, $address, $company_name, $upi_id, $referral_code, $referred_by_reseller_id]);
         $newId = $pdo->lastInsertId();
 
         $_SESSION['user_id'] = $newId;
@@ -165,7 +190,9 @@ if ($method === 'POST' && $action === 'register') {
                 'id' => $newId,
                 'name' => $name,
                 'email' => $email,
-                'role' => $role
+                'role' => $role,
+                'referral_code' => $referral_code,
+                'referred_by_reseller_id' => $referred_by_reseller_id
             ]
         ]);
     } catch (Exception $e) {
@@ -178,3 +205,4 @@ if ($method === 'POST' && $action === 'logout') {
     session_destroy();
     sendJsonResponse(['success' => true, 'message' => 'Logged out successfully']);
 }
+
